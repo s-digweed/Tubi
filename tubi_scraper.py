@@ -18,7 +18,7 @@ def get_proxies(country_code):
     response = requests.get(url)
     if response.status_code == 200:
         proxy_list = response.text.splitlines()
-        return [f"socks4://{proxy}" for proxy in proxy_list]
+        return [f"socks4://{proxy}" for proxy in proxy_list if proxy.strip()]
     else:
         print(f"Failed to fetch proxies for {country_code}. Status code: {response.status_code}")
         return []
@@ -37,7 +37,7 @@ def fetch_channel_list(proxy, retries=3):
                 continue
 
             html_content = response.content.decode('utf-8', errors='replace')
-            html_content = html_content.replace('�', 'ñ')
+            html_content = html_content.replace('', 'ñ')
             soup = BeautifulSoup(html_content, "html.parser")
 
             script_tags = soup.find_all("script")
@@ -66,44 +66,53 @@ def fetch_channel_list(proxy, retries=3):
             print(f"Error fetching data using proxy {proxy}: {e}")
     return []
 
+def find_keys(node, target_key):
+    """Recursively search for all occurrences of a target key in a JSON dict/list."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == target_key:
+                yield value
+            elif isinstance(value, (dict, list)):
+                yield from find_keys(value, target_key)
+    elif isinstance(node, list):
+        for item in node:
+            yield from find_keys(item, target_key)
+
 def create_group_mapping(json_data):
     group_mapping = {}
-    if isinstance(json_data, list):
-        for item in json_data:
-            content_ids_by_container = item.get('epg', {}).get('contentIdsByContainer', {})
-            for container_key, container_list in content_ids_by_container.items():
+    for content_ids in find_keys(json_data, 'contentIdsByContainer'):
+        for container_list in content_ids.values():
+            if isinstance(container_list, list):
                 for category in container_list:
                     group_name = category.get('name', 'Other')
                     for content_id in category.get('contents', []):
                         group_mapping[str(content_id)] = group_name
-    else:
-        content_ids_by_container = json_data.get('epg', {}).get('contentIdsByContainer', {})
-        for container_key, container_list in content_ids_by_container.items():
-            for category in container_list:
-                group_name = category.get('name', 'Other')
-                for content_id in category.get('contents', []):
-                    group_mapping[str(content_id)] = group_name
     return group_mapping
 
-def fetch_epg_data(channel_list):
+def fetch_epg_data(channel_list, proxy=None):
     epg_data = []
     group_size = 150
     grouped_ids = [channel_list[i:i + group_size] for i in range(0, len(channel_list), group_size)]
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
     for group in grouped_ids:
         url = "https://tubitv.com/oz/epg/programming"
         params = {"content_id": ','.join(map(str, group))}
-        response = requests.get(url, params=params)
-
-        if response.status_code != 200:
-            print(f"Failed to fetch EPG data for group {group}. Status code: {response.status_code}")
-            continue
+        proxies = {"http": proxy, "https": proxy} if proxy else None
 
         try:
+            response = requests.get(url, params=params, headers=headers, proxies=proxies, verify=False, timeout=20)
+            if response.status_code != 200:
+                print(f"Failed to fetch EPG API. Status: {response.status_code}")
+                continue
+
             epg_json = response.json()
             epg_data.extend(epg_json.get('rows', []))
-        except json.JSONDecodeError as e:
-            print(f"Error decoding EPG JSON: {e}")
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            print(f"Error fetching EPG JSON: {e}")
 
     return epg_data
 
@@ -184,6 +193,9 @@ def main():
     countries = ["US"]
     for country in countries:
         proxies = get_proxies(country)
+        working_proxy = None
+        json_data = None
+        
         if not proxies:
             print(f"No proxies found for country {country}. Trying without proxy...")
             json_data = fetch_channel_list(None)
@@ -192,6 +204,7 @@ def main():
                 print(f"Trying proxy {proxy} for country {country}...")
                 json_data = fetch_channel_list(proxy)
                 if json_data:
+                    working_proxy = proxy
                     break
             else:
                 print(f"All proxies failed for {country}. Trying without proxy...")
@@ -202,20 +215,27 @@ def main():
             continue
 
         print(f"Successfully fetched data for country {country}")
+        
+        # Robustly extract channel IDs using the recursive search
         channel_list = []
-        if isinstance(json_data, list):
-            for item in json_data:
-                content_ids_by_container = item.get('epg', {}).get('contentIdsByContainer', {})
-                for container_list in content_ids_by_container.values():
+        for content_ids in find_keys(json_data, 'contentIdsByContainer'):
+            for container_list in content_ids.values():
+                if isinstance(container_list, list):
                     for category in container_list:
-                        channel_list.extend(category.get('contents', []))
-        else:
-            content_ids_by_container = json_data.get('epg', {}).get('contentIdsByContainer', {})
-            for container_list in content_ids_by_container.values():
-                for category in container_list:
-                    channel_list.extend(category.get('contents', []))
+                        channels = category.get('contents', [])
+                        if channels:
+                            channel_list.extend(channels)
+                            
+        # Remove any duplicate IDs
+        channel_list = list(set(channel_list))
+        
+        if not channel_list:
+            print("No channel IDs found in the JSON. The site structure may have changed.")
+            continue
 
-        epg_data = fetch_epg_data(channel_list)
+        # Pass the successful proxy into the EPG fetcher
+        epg_data = fetch_epg_data(channel_list, proxy=working_proxy)
+        
         if not epg_data:
             print("No EPG data found.")
             continue
@@ -229,3 +249,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
