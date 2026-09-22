@@ -112,8 +112,9 @@ def shortlist_us(proxies, want):
 # In-page scraper (runs inside Tubi's origin, with the minted token)
 # ---------------------------------------------------------------------------
 
-# Collects every linear channel (type "l") that has a playable manifest,
-# plus a program map for EPG titles. Returns {channels:[...], programs:{...}}.
+# Collects every linear channel (type "l") that has a playable manifest, then
+# pulls the FULL multi-day schedule from the still-alive /oz/epg/programming
+# endpoint. Returns {channels:[...], epg:[...rows...]}.
 JS_SCRAPE = r"""
 async ({ base, slugs }) => {
   const at = (document.cookie.match(/(?:^|;\s*)at=([^;]+)/) || [])[1];
@@ -142,9 +143,8 @@ async ({ base, slugs }) => {
     scan(hs);
   } catch (e) { /* fall back to seed slugs */ }
 
-  // 2) walk each container, collect channels + programs
+  // 2) walk each container, collect linear channels with a playable manifest
   const channels = {};
-  const programs = {};
   for (const slug of discovered) {
     try {
       const url = base + "/api/v7/containers/" + slug
@@ -155,27 +155,40 @@ async ({ base, slugs }) => {
       const group = (j.container && j.container.title) || slug;
       for (const id in j.contents) {
         const c = j.contents[id];
-        if (!c) continue;
-        if (c.type === "l" && Array.isArray(c.video_resources) && c.video_resources.length) {
-          const man = c.video_resources[0] && c.video_resources[0].manifest;
-          const streamUrl = man && man.url;
-          if (!streamUrl) continue;
-          const imgs = c.images || {};
-          const pick = (a) => (Array.isArray(a) && a.length ? a[0] : "");
-          const logo = pick(c.landscape_images) || pick(imgs.landscape_images)
-                     || pick(c.posterarts) || pick(imgs.posterarts) || pick(c.thumbnails);
-          channels[id] = {
-            id, title: c.title || ("Channel " + id), group,
-            logo: logo || "", stream: streamUrl,
-            schedules: Array.isArray(c.schedules) ? c.schedules : [],
-          };
-        } else if (c.type === "v") {
-          programs[id] = { title: c.title || "", description: c.description || "" };
-        }
+        if (!c || c.type !== "l") continue;
+        if (!Array.isArray(c.video_resources) || !c.video_resources.length) continue;
+        const man = c.video_resources[0] && c.video_resources[0].manifest;
+        const streamUrl = man && man.url;
+        if (!streamUrl) continue;
+        const imgs = c.images || {};
+        const pick = (a) => (Array.isArray(a) && a.length ? a[0] : "");
+        const logo = pick(c.landscape_images) || pick(imgs.landscape_images)
+                   || pick(c.posterarts) || pick(imgs.posterarts) || pick(c.thumbnails);
+        channels[id] = {
+          id, title: c.title || ("Channel " + id), group,
+          logo: logo || "", stream: streamUrl,
+        };
       }
     } catch (e) { /* skip a bad container */ }
   }
-  return { channels: Object.values(channels), programs };
+
+  // 3) FULL EPG — /oz/epg/programming is still alive and returns multi-day
+  //    schedules for a batch of content_ids. Same-origin here, so the `at`
+  //    cookie rides along automatically (credentials: include).
+  const ids = Object.keys(channels);
+  const epg = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const batch = ids.slice(i, i + 100).join(",");
+    try {
+      const u = "https://tubitv.com/oz/epg/programming?content_id=" + batch;
+      const j = await fetch(u, { credentials: "include" }).then(r => r.json());
+      if (j && Array.isArray(j.rows)) {
+        for (const row of j.rows) epg.push(row);
+      }
+    } catch (e) { /* skip a bad batch */ }
+  }
+
+  return { channels: Object.values(channels), epg };
 }
 """
 
@@ -244,24 +257,28 @@ def build_m3u(channels):
         lines.append(ch["stream"])
     return "\n".join(lines) + "\n"
 
-def build_epg(channels, programs):
+def build_epg(channels, epg_rows):
     out = ['<?xml version="1.0" encoding="UTF-8"?>', "<tv>"]
+    # channel entries from the scraped channel list
     for ch in channels:
         out.append(
             f'<channel id="{ch["id"]}"><display-name>{esc(ch["title"])}</display-name>'
             + (f'<icon src="{ch["logo"]}" />' if ch["logo"] else "")
             + "</channel>"
         )
-    for ch in channels:
-        for s in ch.get("schedules", []):
-            start = xmltv_time(s.get("start_time", ""))
-            stop = xmltv_time(s.get("end_time", ""))
+    # full programme schedule from /oz/epg/programming rows
+    for row in epg_rows:
+        cid = str(row.get("content_id", ""))
+        if not cid:
+            continue
+        for p in row.get("programs", []):
+            start = xmltv_time(p.get("start_time", ""))
+            stop = xmltv_time(p.get("end_time", ""))
             if not start or not stop:
                 continue
-            prog = programs.get(str(s.get("program_id", "")), {})
-            title = prog.get("title") or ch["title"]
-            desc = prog.get("description") or ""
-            line = (f'<programme start="{start}" stop="{stop}" channel="{ch["id"]}">'
+            title = p.get("title") or ""
+            desc = p.get("description") or ""
+            line = (f'<programme start="{start}" stop="{stop}" channel="{cid}">'
                     f"<title>{esc(title)}</title>")
             if desc:
                 line += f"<desc>{esc(desc)}</desc>"
@@ -305,14 +322,15 @@ def main():
         sys.exit(1)
 
     channels = data["channels"]
-    programs = data.get("programs", {})
+    epg_rows = data.get("epg", [])
+    prog_count = sum(len(r.get("programs", [])) for r in epg_rows)
 
     with open("tubi_playlist.m3u", "w", encoding="utf-8") as f:
         f.write(build_m3u(channels))
     with open("tubi_epg.xml", "w", encoding="utf-8") as f:
-        f.write(build_epg(channels, programs))
+        f.write(build_epg(channels, epg_rows))
 
-    print(f"Done. {len(channels)} channels written.")
+    print(f"Done. {len(channels)} channels, {prog_count} programmes written.")
 
 if __name__ == "__main__":
     main()
