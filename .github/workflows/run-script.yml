@@ -23,7 +23,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 urllib3 pysocks
+          pip install requests pysocks playwright
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
 
       - name: Remove old files
         run: |
@@ -32,10 +35,6 @@ jobs:
 
       - name: Run tubi_scraper.py
         run: python tubi_scraper.py
-        shell: /usr/bin/bash -e {0}
-        env:
-          pythonLocation: /opt/hostedtoolcache/Python/3.13.2/x64
-          LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.13.2/x64/lib
 
       - name: Debug files and commit
         run: |
