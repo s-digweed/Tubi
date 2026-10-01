@@ -4,12 +4,19 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs daily at midnight UTC
+    - cron: '17 0 * * *'  # daily, off the top of the hour
   workflow_dispatch:      # Allows manual triggering
+
+concurrency:
+  group: tubi-scraper
+  cancel-in-progress: false
 
 jobs:
   scrape-tubi:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -23,10 +30,30 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pysocks playwright
+          pip install requests playwright
 
       - name: Install Chromium for Playwright
         run: python -m playwright install --with-deps chromium
+
+      - name: Connect Proton WireGuard (US)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wireguard-tools
+          # Build an IPv4-only full-tunnel config from the secret:
+          #  - drop the DNS line (we set resolv.conf ourselves below)
+          #  - keep only the IPv4 Address CIDR (strip any trailing IPv6)
+          #  - force AllowedIPs to 0.0.0.0/0 (no ::/0 -> runner has no IPv6)
+          printf '%s\n' "${{ secrets.PROTON_WG }}" \
+            | sed -E '/^[[:space:]]*DNS[[:space:]]*=/d' \
+            | sed -E 's#^([[:space:]]*Address[[:space:]]*=[[:space:]]*)([0-9.]+/[0-9]+).*#\1\2#' \
+            | sed -E 's#^([[:space:]]*AllowedIPs[[:space:]]*=).*#\1 0.0.0.0/0#' \
+            | sudo tee /etc/wireguard/wg0.conf >/dev/null
+          sudo wg-quick up wg0
+          # With AllowedIPs 0.0.0.0/0 the runner's default (Azure) DNS becomes
+          # unreachable through the tunnel -> repoint resolv.conf or everything
+          # fails silently.
+          echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf >/dev/null
+          echo "Tunnel up. Exit IP country: $(curl -s --max-time 15 https://ipinfo.io/country)"
 
       - name: Remove old files
         run: |
@@ -34,7 +61,11 @@ jobs:
           echo "Removed old files (if they existed)"
 
       - name: Run tubi_scraper.py
-        run: python tubi_scraper.py
+        run: python -u tubi_scraper.py
+
+      - name: Disconnect WireGuard
+        if: always()
+        run: sudo wg-quick down wg0 || true
 
       - name: Debug files and commit
         run: |
