@@ -9,26 +9,27 @@ Why a browser instead of plain requests:
   Letting Tubi's own JavaScript load and mint the token sidesteps the
   signature entirely, and also carries the correct Origin + geo automatically.
 
+Connectivity:
+  Tubi is US-geo and blocks datacenter IPs. The runner reaches Tubi through a
+  Proton WireGuard US tunnel (set up by the workflow), so the connection is a
+  single stable US exit -- no free-proxy pool. The script refuses to run unless
+  it confirms a US exit IP first (guardrail against a wrong-country tunnel).
+
 Flow:
-  1. Fetch US socks4 proxies, keep only ones whose exit IP is really US.
-  2. Launch Chromium through a US proxy, load tubitv.com/live so Tubi's JS
+  1. Confirm the exit IP is US (ipinfo.io/country).
+  2. Launch Chromium (direct, no proxy), load tubitv.com/live so Tubi's JS
      mints the guest `at` token.
   3. From inside the page, call the tensor-cdn homescreen + per-container
      endpoints with `Authorization: Bearer <at>` and collect the linear
-     channels (type "l") — each already carries its .m3u8 and schedule.
+     channels (type "l") -- each already carries its .m3u8 and schedule.
   4. Build tubi_playlist.m3u + tubi_epg.xml (flat XML for IPTVBoss).
 
-Outputs (same names as the old scraper, so the workflow's commit step is unchanged):
+Outputs (same names as before, so the workflow's commit step is unchanged):
   tubi_playlist.m3u
   tubi_epg.xml
 """
 
-import json
-import os
 import sys
-import time
-import uuid
-import random
 import requests
 from datetime import datetime, timezone
 
@@ -40,11 +41,6 @@ from playwright.sync_api import sync_playwright
 
 # EPG URL advertised inside the M3U. Point this at YOUR repo's raw path.
 EPG_TVG_URL = "https://raw.githubusercontent.com/s-digweed/Tubi/main/tubi_epg.xml"
-
-PROXY_API = (
-    "https://api.proxyscrape.com/v2/?request=displayproxies"
-    "&protocol=socks4&timeout=10000&country=US&ssl=all&anonymity=elite"
-)
 
 BASE = "https://tensor-cdn.production-public.tubi.io"
 
@@ -63,50 +59,25 @@ SEED_SLUGS = [
     "espanol_channels",
 ]
 
-WANT_US_PROXIES = 8      # how many verified-US proxies to shortlist
-MAX_PROXY_TRIES = 8      # how many to actually drive a browser through
+ATTEMPTS       = 3          # how many times to try the whole browser flow
 NAV_TIMEOUT_MS = 60000
-TOKEN_WAIT_S = 30
+TOKEN_WAIT_S   = 45         # direct US connection mints fast; 45s is generous
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 # ---------------------------------------------------------------------------
-# Proxy handling
+# Geo guardrail
 # ---------------------------------------------------------------------------
 
-def get_proxies():
+def exit_country():
     try:
-        r = requests.get(PROXY_API, timeout=20)
+        r = requests.get("https://ipinfo.io/country", timeout=10)
         if r.status_code == 200:
-            return [p.strip() for p in r.text.splitlines() if p.strip()]
+            return r.text.strip()
     except Exception as e:
-        print(f"proxy fetch error: {e}")
-    return []
-
-def is_us_exit(hostport):
-    """Fast check: does this socks4 proxy egress from a US IP?"""
-    proxy = f"socks4://{hostport}"
-    try:
-        r = requests.get(
-            "https://ipinfo.io/country",
-            proxies={"http": proxy, "https": proxy},
-            timeout=6,
-        )
-        return r.status_code == 200 and r.text.strip() == "US"
-    except Exception:
-        return False
-
-def shortlist_us(proxies, want):
-    random.shuffle(proxies)
-    good = []
-    for hp in proxies:
-        if is_us_exit(hp):
-            good.append(hp)
-            print(f"  US proxy ok: {hp}")
-            if len(good) >= want:
-                break
-    return good
+        print(f"  country check error: {e}")
+    return "?"
 
 # ---------------------------------------------------------------------------
 # In-page scraper (runs inside Tubi's origin, with the minted token)
@@ -129,7 +100,7 @@ async ({ base, slugs }) => {
     "images[title_art]=w430h180_title",
   ].join("&");
 
-  // 1) homescreen — discover which linear containers exist right now
+  // 1) homescreen -- discover which linear containers exist right now
   const discovered = new Set(slugs);
   try {
     const hsUrl = base + "/api/v8/homescreen?include_channels=true&contents_limit=10"
@@ -172,7 +143,7 @@ async ({ base, slugs }) => {
     } catch (e) { /* skip a bad container */ }
   }
 
-  // 3) FULL EPG — /oz/epg/programming is still alive and returns multi-day
+  // 3) FULL EPG -- /oz/epg/programming is still alive and returns multi-day
   //    schedules for a batch of content_ids. Same-origin here, so the `at`
   //    cookie rides along automatically (credentials: include).
   const ids = Object.keys(channels);
@@ -192,11 +163,9 @@ async ({ base, slugs }) => {
 }
 """
 
-def scrape_via_browser(pw, hostport):
-    proxy = {"server": f"socks4://{hostport}"}
+def scrape_via_browser(pw):
     browser = pw.chromium.launch(
         headless=True,
-        proxy=proxy,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
     try:
@@ -213,18 +182,29 @@ def scrape_via_browser(pw, hostport):
                 break
             page.wait_for_timeout(1000)
         if not token_seen:
-            print(f"  {hostport}: no token cookie after {TOKEN_WAIT_S}s")
+            # diagnostics: is this a block page, a slow load, or a changed flow?
+            try:
+                names = sorted(c["name"] for c in ctx.cookies())
+                body = page.evaluate(
+                    "() => document.body ? document.body.innerText.slice(0,300) : ''")
+                print(f"  no token cookie after {TOKEN_WAIT_S}s")
+                print(f"    url={page.url}")
+                print(f"    title={page.title()!r}")
+                print(f"    cookies={names}")
+                print(f"    body[:300]={body!r}")
+            except Exception as e:
+                print(f"  no token cookie; diag failed: {e}")
             return None
 
         data = page.evaluate(JS_SCRAPE, {"base": BASE, "slugs": SEED_SLUGS})
         if not data or data.get("error"):
-            print(f"  {hostport}: page error {data}")
+            print(f"  page error {data}")
             return None
         chans = data.get("channels", [])
         if not chans:
-            print(f"  {hostport}: 0 channels returned")
+            print("  0 channels returned")
             return None
-        print(f"  {hostport}: {len(chans)} channels")
+        print(f"  {len(chans)} channels")
         return data
     finally:
         browser.close()
@@ -292,27 +272,21 @@ def build_epg(channels, epg_rows):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("Fetching proxies...")
-    proxies = get_proxies()
-    print(f"  {len(proxies)} raw proxies")
-    if not proxies:
-        print("No proxies; aborting.")
-        sys.exit(1)
-
-    print("Verifying US exits...")
-    us = shortlist_us(proxies, WANT_US_PROXIES)
-    if not us:
-        print("No verified-US proxies; aborting.")
+    country = exit_country()
+    print(f"Exit IP country: {country}")
+    if country != "US":
+        print("ERROR: exit IP is not US - the WireGuard tunnel is down or wrong-country. "
+              "Aborting so we don't scrape the wrong catalog.")
         sys.exit(1)
 
     data = None
     with sync_playwright() as pw:
-        for hp in us[:MAX_PROXY_TRIES]:
-            print(f"Trying browser via {hp} ...")
+        for n in range(1, ATTEMPTS + 1):
+            print(f"Browser attempt {n}/{ATTEMPTS} ...")
             try:
-                data = scrape_via_browser(pw, hp)
+                data = scrape_via_browser(pw)
             except Exception as e:
-                print(f"  {hp}: {e}")
+                print(f"  attempt {n} error: {e}")
                 data = None
             if data:
                 break
